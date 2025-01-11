@@ -16,12 +16,15 @@
 
 #include "snapuserd_core.h"
 
-#include <sys/utsname.h>
-
 #include <android-base/chrono_utils.h>
 #include <android-base/properties.h>
 #include <android-base/scopeguard.h>
 #include <android-base/strings.h>
+#include <snapuserd/dm_user_block_server.h>
+
+#include "merge_worker.h"
+#include "read_worker.h"
+#include "utility.h"
 
 namespace android {
 namespace snapshot {
@@ -32,23 +35,26 @@ using android::base::unique_fd;
 
 SnapshotHandler::SnapshotHandler(std::string misc_name, std::string cow_device,
                                  std::string backing_device, std::string base_path_merge,
-                                 int num_worker_threads, bool use_iouring,
-                                 bool perform_verification) {
+                                 std::shared_ptr<IBlockServerOpener> opener, int num_worker_threads,
+                                 bool use_iouring, bool perform_verification, bool o_direct,
+                                 uint32_t cow_op_merge_size) {
     misc_name_ = std::move(misc_name);
     cow_device_ = std::move(cow_device);
     backing_store_device_ = std::move(backing_device);
-    control_device_ = "/dev/dm-user/" + misc_name_;
+    block_server_opener_ = std::move(opener);
     base_path_merge_ = std::move(base_path_merge);
     num_worker_threads_ = num_worker_threads;
     is_io_uring_enabled_ = use_iouring;
     perform_verification_ = perform_verification;
+    o_direct_ = o_direct;
+    cow_op_merge_size_ = cow_op_merge_size;
 }
 
 bool SnapshotHandler::InitializeWorkers() {
     for (int i = 0; i < num_worker_threads_; i++) {
-        std::unique_ptr<Worker> wt =
-                std::make_unique<Worker>(cow_device_, backing_store_device_, control_device_,
-                                         misc_name_, base_path_merge_, GetSharedPtr());
+        auto wt = std::make_unique<ReadWorker>(cow_device_, backing_store_device_, misc_name_,
+                                               base_path_merge_, GetSharedPtr(),
+                                               block_server_opener_, o_direct_);
         if (!wt->Init()) {
             SNAP_LOG(ERROR) << "Thread initialization failed";
             return false;
@@ -56,12 +62,11 @@ bool SnapshotHandler::InitializeWorkers() {
 
         worker_threads_.push_back(std::move(wt));
     }
-
-    merge_thread_ = std::make_unique<Worker>(cow_device_, backing_store_device_, control_device_,
-                                             misc_name_, base_path_merge_, GetSharedPtr());
+    merge_thread_ = std::make_unique<MergeWorker>(cow_device_, misc_name_, base_path_merge_,
+                                                  GetSharedPtr(), cow_op_merge_size_);
 
     read_ahead_thread_ = std::make_unique<ReadAhead>(cow_device_, backing_store_device_, misc_name_,
-                                                     GetSharedPtr());
+                                                     GetSharedPtr(), cow_op_merge_size_);
 
     update_verify_ = std::make_unique<UpdateVerify>(misc_name_);
 
@@ -79,6 +84,10 @@ void SnapshotHandler::UpdateMergeCompletionPercentage() {
     SNAP_LOG(DEBUG) << "Merge-complete %: " << merge_completion_percentage_
                     << " num_merge_ops: " << ch->num_merge_ops
                     << " total-ops: " << reader_->get_num_total_data_ops();
+
+    if (ch->num_merge_ops == reader_->get_num_total_data_ops()) {
+        MarkMergeComplete();
+    }
 }
 
 bool SnapshotHandler::CommitMerge(int num_merge_ops) {
@@ -105,7 +114,7 @@ bool SnapshotHandler::CommitMerge(int num_merge_ops) {
             return false;
         }
 
-        if (!android::base::WriteFully(cow_fd_, &header, sizeof(CowHeader))) {
+        if (!android::base::WriteFully(cow_fd_, &header, header.prefix.header_size)) {
             SNAP_PLOG(ERROR) << "Write to header failed";
             return false;
         }
@@ -169,6 +178,10 @@ bool SnapshotHandler::ReadMetadata() {
     }
 
     SNAP_LOG(INFO) << "Merge-ops: " << header.num_merge_ops;
+    if (header.num_merge_ops) {
+        resume_merge_ = true;
+        SNAP_LOG(INFO) << "Resume Snapshot-merge";
+    }
 
     if (!MmapMetadata()) {
         SNAP_LOG(ERROR) << "mmap failed";
@@ -188,13 +201,13 @@ bool SnapshotHandler::ReadMetadata() {
     while (!cowop_iter->AtEnd()) {
         const CowOperation* cow_op = cowop_iter->Get();
 
-        if (cow_op->type == kCowCopyOp) {
+        if (cow_op->type() == kCowCopyOp) {
             copy_ops += 1;
-        } else if (cow_op->type == kCowReplaceOp) {
+        } else if (cow_op->type() == kCowReplaceOp) {
             replace_ops += 1;
-        } else if (cow_op->type == kCowZeroOp) {
+        } else if (cow_op->type() == kCowZeroOp) {
             zero_ops += 1;
-        } else if (cow_op->type == kCowXorOp) {
+        } else if (cow_op->type() == kCowXorOp) {
             xor_ops += 1;
         }
 
@@ -240,9 +253,9 @@ bool SnapshotHandler::ReadMetadata() {
 bool SnapshotHandler::MmapMetadata() {
     const auto& header = reader_->GetHeader();
 
-    total_mapped_addr_length_ = header.header_size + BUFFER_REGION_DEFAULT_SIZE;
+    total_mapped_addr_length_ = header.prefix.header_size + BUFFER_REGION_DEFAULT_SIZE;
 
-    if (header.major_version >= 2 && header.buffer_size > 0) {
+    if (header.prefix.major_version >= 2 && header.buffer_size > 0) {
         scratch_space_ = true;
     }
 
@@ -278,20 +291,6 @@ bool SnapshotHandler::InitCowDevice() {
         return false;
     }
 
-    unique_fd fd(TEMP_FAILURE_RETRY(open(base_path_merge_.c_str(), O_RDONLY | O_CLOEXEC)));
-    if (fd < 0) {
-        SNAP_LOG(ERROR) << "Cannot open block device";
-        return false;
-    }
-
-    uint64_t dev_sz = get_block_device_size(fd.get());
-    if (!dev_sz) {
-        SNAP_LOG(ERROR) << "Failed to find block device size: " << base_path_merge_;
-        return false;
-    }
-
-    num_sectors_ = dev_sz >> SECTOR_SHIFT;
-
     return ReadMetadata();
 }
 
@@ -305,21 +304,26 @@ bool SnapshotHandler::Start() {
     if (ra_thread_) {
         ra_thread_status =
                 std::async(std::launch::async, &ReadAhead::RunThread, read_ahead_thread_.get());
-
-        SNAP_LOG(INFO) << "Read-ahead thread started...";
+        // If this is a merge-resume path, wait until RA thread is fully up as
+        // the data has to be re-constructed from the scratch space.
+        if (resume_merge_ && ShouldReconstructDataFromCow()) {
+            WaitForRaThreadToStart();
+        }
     }
 
     // Launch worker threads
     for (int i = 0; i < worker_threads_.size(); i++) {
         threads.emplace_back(
-                std::async(std::launch::async, &Worker::RunThread, worker_threads_[i].get()));
+                std::async(std::launch::async, &ReadWorker::Run, worker_threads_[i].get()));
     }
 
     std::future<bool> merge_thread =
-            std::async(std::launch::async, &Worker::RunMergeThread, merge_thread_.get());
+            std::async(std::launch::async, &MergeWorker::Run, merge_thread_.get());
 
     // Now that the worker threads are up, scan the partitions.
-    if (perform_verification_) {
+    // If the snapshot-merge is being resumed, there is no need to scan as the
+    // current slot is already marked as boot complete.
+    if (perform_verification_ && !resume_merge_) {
         update_verify_->VerifyUpdatePartition();
     }
 
@@ -362,7 +366,7 @@ bool SnapshotHandler::Start() {
 uint64_t SnapshotHandler::GetBufferMetadataOffset() {
     const auto& header = reader_->GetHeader();
 
-    return (header.header_size + sizeof(BufferState));
+    return (header.prefix.header_size + sizeof(BufferState));
 }
 
 /*
@@ -390,7 +394,7 @@ size_t SnapshotHandler::GetBufferMetadataSize() {
 size_t SnapshotHandler::GetBufferDataOffset() {
     const auto& header = reader_->GetHeader();
 
-    return (header.header_size + GetBufferMetadataSize());
+    return (header.prefix.header_size + GetBufferMetadataSize());
 }
 
 /*
@@ -413,27 +417,12 @@ struct BufferState* SnapshotHandler::GetBufferState() {
     const auto& header = reader_->GetHeader();
 
     struct BufferState* ra_state =
-            reinterpret_cast<struct BufferState*>((char*)mapped_addr_ + header.header_size);
+            reinterpret_cast<struct BufferState*>((char*)mapped_addr_ + header.prefix.header_size);
     return ra_state;
 }
 
 bool SnapshotHandler::IsIouringSupported() {
-    struct utsname uts;
-    unsigned int major, minor;
-
-    if ((uname(&uts) != 0) || (sscanf(uts.release, "%u.%u", &major, &minor) != 2)) {
-        SNAP_LOG(ERROR) << "Could not parse the kernel version from uname. "
-                        << " io_uring not supported";
-        return false;
-    }
-
-    // We will only support kernels from 5.6 onwards as IOSQE_ASYNC flag and
-    // IO_URING_OP_READ/WRITE opcodes were introduced only on 5.6 kernel
-    if (major >= 5) {
-        if (major == 5 && minor < 6) {
-            return false;
-        }
-    } else {
+    if (!KernelSupportsIoUring()) {
         return false;
     }
 
@@ -446,6 +435,32 @@ bool SnapshotHandler::IsIouringSupported() {
 
     // Finally check the system property
     return android::base::GetBoolProperty("ro.virtual_ab.io_uring.enabled", false);
+}
+
+bool SnapshotHandler::CheckPartitionVerification() {
+    return update_verify_->CheckPartitionVerification();
+}
+
+void SnapshotHandler::FreeResources() {
+    worker_threads_.clear();
+    read_ahead_thread_ = nullptr;
+    merge_thread_ = nullptr;
+}
+
+uint64_t SnapshotHandler::GetNumSectors() const {
+    unique_fd fd(TEMP_FAILURE_RETRY(open(base_path_merge_.c_str(), O_RDONLY | O_CLOEXEC)));
+    if (fd < 0) {
+        SNAP_LOG(ERROR) << "Cannot open base path: " << base_path_merge_;
+        return false;
+    }
+
+    uint64_t dev_sz = get_block_device_size(fd.get());
+    if (!dev_sz) {
+        SNAP_LOG(ERROR) << "Failed to find block device size: " << base_path_merge_;
+        return false;
+    }
+
+    return dev_sz / SECTOR_SIZE;
 }
 
 }  // namespace snapshot

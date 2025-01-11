@@ -30,6 +30,8 @@
 #include <storage_literals/storage_literals.h>
 #include <update_engine/update_metadata.pb.h>
 
+#include "utility.h"
+
 namespace android {
 namespace snapshot {
 
@@ -77,7 +79,7 @@ class TestDeviceInfo : public SnapshotManager::IDeviceInfo {
         : TestDeviceInfo(fake_super) {
         set_slot_suffix(slot_suffix);
     }
-    std::string GetMetadataDir() const override { return "/metadata/ota/test"s; }
+    std::string GetMetadataDir() const override { return metadata_dir_; }
     std::string GetSlotSuffix() const override { return slot_suffix_; }
     std::string GetOtherSlotSuffix() const override { return slot_suffix_ == "_a" ? "_b" : "_a"; }
     std::string GetSuperDevice([[maybe_unused]] uint32_t slot) const override { return "super"; }
@@ -90,6 +92,7 @@ class TestDeviceInfo : public SnapshotManager::IDeviceInfo {
     }
     bool IsOverlayfsSetup() const override { return false; }
     bool IsRecovery() const override { return recovery_; }
+    bool SetActiveBootSlot([[maybe_unused]] unsigned int slot) override { return true; }
     bool SetSlotAsUnbootable(unsigned int slot) override {
         unbootable_slots_.insert(slot);
         return true;
@@ -117,6 +120,7 @@ class TestDeviceInfo : public SnapshotManager::IDeviceInfo {
     void set_dm(android::dm::IDeviceMapper* dm) { dm_ = dm; }
 
     MergeStatus merge_status() const { return merge_status_; }
+    bool IsTempMetadata() const override { return temp_metadata_; }
 
   private:
     std::string slot_suffix_ = "_a";
@@ -126,6 +130,8 @@ class TestDeviceInfo : public SnapshotManager::IDeviceInfo {
     bool first_stage_init_ = false;
     std::unordered_set<uint32_t> unbootable_slots_;
     android::dm::IDeviceMapper* dm_ = nullptr;
+    std::string metadata_dir_ = "/metadata/ota/test";
+    bool temp_metadata_ = false;
 };
 
 class DeviceMapperWrapper : public android::dm::IDeviceMapper {
@@ -154,6 +160,9 @@ class DeviceMapperWrapper : public android::dm::IDeviceMapper {
     }
     virtual bool GetTableStatus(const std::string& name, std::vector<TargetInfo>* table) {
         return impl_.GetTableStatus(name, table);
+    }
+    virtual bool GetTableStatusIma(const std::string& name, std::vector<TargetInfo>* table) {
+        return impl_.GetTableStatusIma(name, table);
     }
     virtual bool GetDmDevicePathByName(const std::string& name, std::string* path) {
         return impl_.GetDmDevicePathByName(name, path);
@@ -198,7 +207,7 @@ void DeleteBackingImage(android::fiemap::IImageManager* manager, const std::stri
 // Expect space of |path| is multiple of 4K.
 bool WriteRandomData(const std::string& path, std::optional<size_t> expect_size = std::nullopt,
                      std::string* hash = nullptr);
-std::string HashSnapshot(ISnapshotWriter* writer);
+std::string HashSnapshot(ICowWriter::FileDescriptor* writer);
 
 std::string ToHexString(const uint8_t* buf, size_t len);
 
@@ -230,6 +239,22 @@ bool IsVirtualAbEnabled();
     } while (0)
 
 #define RETURN_IF_NON_VIRTUAL_AB() RETURN_IF_NON_VIRTUAL_AB_MSG("")
+
+#define SKIP_IF_VENDOR_ON_ANDROID_S()                                        \
+    do {                                                                     \
+        if (IsVendorFromAndroid12())                                         \
+            GTEST_SKIP() << "Skip test as Vendor partition is on Android S"; \
+    } while (0)
+
+#define RETURN_IF_VENDOR_ON_ANDROID_S_MSG(msg) \
+    do {                                       \
+        if (IsVendorFromAndroid12()) {         \
+            std::cerr << (msg);                \
+            return;                            \
+        }                                      \
+    } while (0)
+
+#define RETURN_IF_VENDOR_ON_ANDROID_S() RETURN_IF_VENDOR_ON_ANDROID_S_MSG("")
 
 }  // namespace snapshot
 }  // namespace android

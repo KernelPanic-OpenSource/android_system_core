@@ -17,6 +17,7 @@
 #define LOG_TAG "DEBUG"
 
 #include "libdebuggerd/tombstone.h"
+#include "libdebuggerd/tombstone_proto_to_text.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -76,7 +77,7 @@ void engrave_tombstone_ucontext(int tombstone_fd, int proto_fd, uint64_t abort_m
   threads[target_tid] = ThreadInfo {
     .registers = std::move(regs), .uid = uid, .tid = target_tid,
     .thread_name = std::move(thread_name), .pid = pid, .command_line = std::move(command_line),
-    .selinux_label = std::move(selinux_label), .siginfo = siginfo,
+    .selinux_label = std::move(selinux_label), .siginfo = siginfo, .signo = siginfo->si_signo,
     // Only supported on aarch64 for now.
 #if defined(__aarch64__)
     .tagged_addr_ctrl = prctl(PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0),
@@ -125,10 +126,12 @@ void engrave_tombstone(unique_fd output_fd, unique_fd proto_fd,
                        unwindstack::AndroidUnwinder* unwinder,
                        const std::map<pid_t, ThreadInfo>& threads, pid_t target_thread,
                        const ProcessInfo& process_info, OpenFilesList* open_files,
-                       std::string* amfd_data) {
+                       std::string* amfd_data, const Architecture* guest_arch,
+                       unwindstack::AndroidUnwinder* guest_unwinder) {
   // Don't copy log messages to tombstone unless this is a development device.
   Tombstone tombstone;
-  engrave_tombstone_proto(&tombstone, unwinder, threads, target_thread, process_info, open_files);
+  engrave_tombstone_proto(&tombstone, unwinder, threads, target_thread, process_info, open_files,
+                          guest_arch, guest_unwinder);
 
   if (proto_fd != -1) {
     if (!tombstone.SerializeToFileDescriptor(proto_fd.get())) {
@@ -143,7 +146,10 @@ void engrave_tombstone(unique_fd output_fd, unique_fd proto_fd,
   log.tfd = output_fd.get();
   log.amfd_data = amfd_data;
 
-  tombstone_proto_to_text(tombstone, [&log](const std::string& line, bool should_log) {
-    _LOG(&log, should_log ? logtype::HEADER : logtype::LOGS, "%s\n", line.c_str());
-  });
+  tombstone_proto_to_text(
+      tombstone,
+      [&log](const std::string& line, bool should_log) {
+        _LOG(&log, should_log ? logtype::HEADER : logtype::LOGS, "%s\n", line.c_str());
+      },
+      [](const BacktraceFrame&) {});
 }
