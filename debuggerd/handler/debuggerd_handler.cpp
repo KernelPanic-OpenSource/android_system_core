@@ -36,10 +36,12 @@
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <android-base/macros.h>
 #include <android-base/parsebool.h>
+#include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/unique_fd.h>
 #include <async_safe/log.h>
@@ -108,11 +110,64 @@ static bool is_permissive_mte() {
                            "persist.device_config.memory_safety_native.permissive.process.%s",
                            getprogname());
   // DO NOT REPLACE this with GetBoolProperty. That uses std::string which allocates, so it is
-  // not async-safe (and this functiong gets used in a signal handler).
+  // not async-safe, and this function gets used in a signal handler.
   return property_parse_bool("persist.sys.mte.permissive") ||
          property_parse_bool("persist.device_config.memory_safety_native.permissive.default") ||
          property_parse_bool(process_sysprop_name) ||
          (permissive_env && ParseBool(permissive_env) == ParseBoolResult::kTrue);
+}
+
+static bool parse_uint_with_error_reporting(const char* s, const char* name, int* v) {
+  if (android::base::ParseInt(s, v) && *v >= 0) {
+    return true;
+  }
+  async_safe_format_log(ANDROID_LOG_ERROR, "libc", "invalid %s: %s", name, s);
+  return false;
+}
+
+// We cannot use base::GetIntProperty, because that internally uses
+// std::string, which allocates.
+static bool property_parse_int(const char* name, int* out) {
+  const prop_info* pi = __system_property_find(name);
+  if (!pi) return false;
+  struct cookie_t {
+    int* out;
+    bool empty;
+  } cookie{out, true};
+  __system_property_read_callback(
+      pi,
+      [](void* raw_cookie, const char* name, const char* value, uint32_t) {
+        // Property is set to empty value, ignoring.
+        if (!*value) return;
+        cookie_t* cookie = reinterpret_cast<cookie_t*>(raw_cookie);
+        if (parse_uint_with_error_reporting(value, name, cookie->out)) cookie->empty = false;
+      },
+      &cookie);
+  return !cookie.empty;
+}
+
+static int permissive_mte_renable_timer() {
+  if (char* env = getenv("MTE_PERMISSIVE_REENABLE_TIME_CPUMS")) {
+    int v;
+    if (parse_uint_with_error_reporting(env, "MTE_PERMISSIVE_REENABLE_TIME_CPUMS", &v)) return v;
+  }
+
+  char process_sysprop_name[512];
+  async_safe_format_buffer(process_sysprop_name, sizeof(process_sysprop_name),
+                           "persist.sys.mte.permissive_reenable_timer.process.%s", getprogname());
+  int v;
+  if (property_parse_int(process_sysprop_name, &v)) return v;
+  if (property_parse_int("persist.sys.mte.permissive_reenable_timer.default", &v)) return v;
+  char process_deviceconf_sysprop_name[512];
+  async_safe_format_buffer(
+      process_deviceconf_sysprop_name, sizeof(process_deviceconf_sysprop_name),
+      "persist.device_config.memory_safety_native.permissive_reenable_timer.process.%s",
+      getprogname());
+  if (property_parse_int(process_deviceconf_sysprop_name, &v)) return v;
+  if (property_parse_int(
+          "persist.device_config.memory_safety_native.permissive_reenable_timer.default", &v))
+    return v;
+  return 0;
 }
 
 static inline void futex_wait(volatile void* ftx, int value) {
@@ -275,10 +330,6 @@ static void raise_caps() {
   }
 }
 
-static pid_t __fork() {
-  return clone(nullptr, nullptr, 0, nullptr);
-}
-
 // Double-clone, with CLONE_FILES to share the file descriptor table for kcmp validation.
 // Returns 0 in the orphaned child, the pid of the orphan in the original process, or -1 on failure.
 static void create_vm_process() {
@@ -338,6 +389,13 @@ static DebuggerdDumpType get_dump_type(const debugger_thread_info* thread_info) 
   return kDebuggerdTombstoneProto;
 }
 
+static const char* get_unwind_type(const debugger_thread_info* thread_info) {
+  if (thread_info->siginfo->si_signo == BIONIC_SIGNAL_DEBUGGER) {
+    return "Unwind request";
+  }
+  return "Crash due to signal";
+}
+
 static int debuggerd_dispatch_pseudothread(void* arg) {
   debugger_thread_info* thread_info = static_cast<debugger_thread_info*>(arg);
 
@@ -395,7 +453,9 @@ static int debuggerd_dispatch_pseudothread(void* arg) {
     ASSERT_SAME_OFFSET(scudo_region_info, scudo_region_info);
     ASSERT_SAME_OFFSET(scudo_ring_buffer, scudo_ring_buffer);
     ASSERT_SAME_OFFSET(scudo_ring_buffer_size, scudo_ring_buffer_size);
-    ASSERT_SAME_OFFSET(recoverable_gwp_asan_crash, recoverable_gwp_asan_crash);
+    ASSERT_SAME_OFFSET(scudo_stack_depot_size, scudo_stack_depot_size);
+    ASSERT_SAME_OFFSET(recoverable_crash, recoverable_crash);
+    ASSERT_SAME_OFFSET(crash_detail_page, crash_detail_page);
 #undef ASSERT_SAME_OFFSET
 
     iovs[3] = {.iov_base = &thread_info->process_info,
@@ -424,7 +484,7 @@ static int debuggerd_dispatch_pseudothread(void* arg) {
   }
 
   // Don't use fork(2) to avoid calling pthread_atfork handlers.
-  pid_t crash_dump_pid = __fork();
+  pid_t crash_dump_pid = _Fork();
   if (crash_dump_pid == -1) {
     async_safe_format_log(ANDROID_LOG_FATAL, "libc",
                           "failed to fork in debuggerd signal handler: %s", strerror(errno));
@@ -449,8 +509,8 @@ static int debuggerd_dispatch_pseudothread(void* arg) {
 
     execle(CRASH_DUMP_PATH, CRASH_DUMP_NAME, main_tid, pseudothread_tid, debuggerd_dump_type,
            nullptr, nullptr);
-    async_safe_format_log(ANDROID_LOG_FATAL, "libc", "failed to exec crash_dump helper: %s",
-                          strerror(errno));
+    async_safe_format_log(ANDROID_LOG_FATAL, "libc", "%s: failed to exec crash_dump helper: %s",
+                          get_unwind_type(thread_info), strerror(errno));
     return 1;
   }
 
@@ -471,26 +531,30 @@ static int debuggerd_dispatch_pseudothread(void* arg) {
   } else {
     // Something went wrong, log it.
     if (rc == -1) {
-      async_safe_format_log(ANDROID_LOG_FATAL, "libc", "read of IPC pipe failed: %s",
-                            strerror(errno));
+      async_safe_format_log(ANDROID_LOG_FATAL, "libc", "%s: read of IPC pipe failed: %s",
+                            get_unwind_type(thread_info), strerror(errno));
     } else if (rc == 0) {
       async_safe_format_log(ANDROID_LOG_FATAL, "libc",
-                            "crash_dump helper failed to exec, or was killed");
+                            "%s: crash_dump helper failed to exec, or was killed",
+                            get_unwind_type(thread_info));
     } else if (rc != 1) {
       async_safe_format_log(ANDROID_LOG_FATAL, "libc",
-                            "read of IPC pipe returned unexpected value: %zd", rc);
+                            "%s: read of IPC pipe returned unexpected value: %zd",
+                            get_unwind_type(thread_info), rc);
     } else if (buf[0] != '\1') {
-      async_safe_format_log(ANDROID_LOG_FATAL, "libc", "crash_dump helper reported failure");
+      async_safe_format_log(ANDROID_LOG_FATAL, "libc", "%s: crash_dump helper reported failure",
+                            get_unwind_type(thread_info));
     }
   }
 
   // Don't leave a zombie child.
   int status;
   if (TEMP_FAILURE_RETRY(waitpid(crash_dump_pid, &status, 0)) == -1) {
-    async_safe_format_log(ANDROID_LOG_FATAL, "libc", "failed to wait for crash_dump helper: %s",
-                          strerror(errno));
+    async_safe_format_log(ANDROID_LOG_FATAL, "libc", "%s: failed to wait for crash_dump helper: %s",
+                          get_unwind_type(thread_info), strerror(errno));
   } else if (WIFSTOPPED(status) || WIFSIGNALED(status)) {
-    async_safe_format_log(ANDROID_LOG_FATAL, "libc", "crash_dump helper crashed or stopped");
+    async_safe_format_log(ANDROID_LOG_FATAL, "libc", "%s: crash_dump helper crashed or stopped",
+                          get_unwind_type(thread_info));
   }
 
   if (success) {
@@ -552,8 +616,14 @@ static void debuggerd_signal_handler(int signal_number, siginfo_t* info, void* c
   }
 
   debugger_process_info process_info = {};
+  if (g_callbacks.get_process_info) {
+    process_info = g_callbacks.get_process_info();
+  }
   uintptr_t si_val = reinterpret_cast<uintptr_t>(info->si_ptr);
   if (signal_number == BIONIC_SIGNAL_DEBUGGER) {
+    // Applications can set abort messages via android_set_abort_message without
+    // actually aborting; ignore those messages in non-fatal dumps.
+    process_info.abort_msg = nullptr;
     if (info->si_code == SI_QUEUE && info->si_pid == __getpid()) {
       // Allow for the abort message to be explicitly specified via the sigqueue value.
       // Keep the bottom bit intact for representing whether we want a backtrace or a tombstone.
@@ -562,24 +632,74 @@ static void debuggerd_signal_handler(int signal_number, siginfo_t* info, void* c
         info->si_ptr = reinterpret_cast<void*>(si_val & 1);
       }
     }
-  } else if (g_callbacks.get_process_info) {
-    process_info = g_callbacks.get_process_info();
   }
 
-  // GWP-ASan catches use-after-free and heap-buffer-overflow by using PROT_NONE
-  // guard pages, which lead to SEGV. Normally, debuggerd prints a bug report
-  // and the process terminates, but in some cases, we actually want to print
-  // the bug report and let the signal handler return, and restart the process.
-  // In order to do that, we need to disable GWP-ASan's guard pages. The
-  // following callbacks handle this case.
-  gwp_asan_callbacks_t gwp_asan_callbacks = g_callbacks.get_gwp_asan_callbacks();
-  if (signal_number == SIGSEGV && signal_has_si_addr(info) &&
-      gwp_asan_callbacks.debuggerd_needs_gwp_asan_recovery &&
-      gwp_asan_callbacks.debuggerd_gwp_asan_pre_crash_report &&
-      gwp_asan_callbacks.debuggerd_gwp_asan_post_crash_report &&
-      gwp_asan_callbacks.debuggerd_needs_gwp_asan_recovery(info->si_addr)) {
-    gwp_asan_callbacks.debuggerd_gwp_asan_pre_crash_report(info->si_addr);
-    process_info.recoverable_gwp_asan_crash = true;
+  gwp_asan_callbacks_t gwp_asan_callbacks = {};
+  bool recoverable_gwp_asan_crash = false;
+  if (g_callbacks.get_gwp_asan_callbacks != nullptr) {
+    // GWP-ASan catches use-after-free and heap-buffer-overflow by using PROT_NONE
+    // guard pages, which lead to SEGV. Normally, debuggerd prints a bug report
+    // and the process terminates, but in some cases, we actually want to print
+    // the bug report and let the signal handler return, and restart the process.
+    // In order to do that, we need to disable GWP-ASan's guard pages. The
+    // following callbacks handle this case.
+    gwp_asan_callbacks = g_callbacks.get_gwp_asan_callbacks();
+    if (signal_number == SIGSEGV && signal_has_si_addr(info) &&
+        gwp_asan_callbacks.debuggerd_needs_gwp_asan_recovery &&
+        gwp_asan_callbacks.debuggerd_gwp_asan_pre_crash_report &&
+        gwp_asan_callbacks.debuggerd_gwp_asan_post_crash_report &&
+        gwp_asan_callbacks.debuggerd_needs_gwp_asan_recovery(info->si_addr)) {
+      gwp_asan_callbacks.debuggerd_gwp_asan_pre_crash_report(info->si_addr);
+      recoverable_gwp_asan_crash = true;
+      process_info.recoverable_crash = true;
+    }
+  }
+
+  if (info->si_signo == SIGSEGV &&
+      (info->si_code == SEGV_MTESERR || info->si_code == SEGV_MTEAERR) && is_permissive_mte()) {
+    process_info.recoverable_crash = true;
+    // If we are in permissive MTE mode, we do not crash, but instead disable MTE on this thread,
+    // and then let the failing instruction be retried. The second time should work (except
+    // if there is another non-MTE fault).
+    int tagged_addr_ctrl = prctl(PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0);
+    if (tagged_addr_ctrl < 0) {
+      fatal_errno("failed to PR_GET_TAGGED_ADDR_CTRL");
+    }
+    int previous = tagged_addr_ctrl & PR_MTE_TCF_MASK;
+    tagged_addr_ctrl = (tagged_addr_ctrl & ~PR_MTE_TCF_MASK) | PR_MTE_TCF_NONE;
+    if (prctl(PR_SET_TAGGED_ADDR_CTRL, tagged_addr_ctrl, 0, 0, 0) < 0) {
+      fatal_errno("failed to PR_SET_TAGGED_ADDR_CTRL");
+    }
+    if (int reenable_timer = permissive_mte_renable_timer()) {
+      async_safe_format_log(ANDROID_LOG_ERROR, "libc",
+                            "MTE ERROR DETECTED BUT RUNNING IN PERMISSIVE MODE. CONTINUING WITH "
+                            "MTE DISABLED FOR %d MS OF CPU TIME.",
+                            reenable_timer);
+      timer_t timerid{};
+      struct sigevent sev {};
+      sev.sigev_signo = BIONIC_ENABLE_MTE;
+      sev.sigev_notify = SIGEV_THREAD_ID;
+      sev.sigev_value.sival_int = previous;
+      sev.sigev_notify_thread_id = __gettid();
+      // This MUST be CLOCK_THREAD_CPUTIME_ID. If we used CLOCK_MONOTONIC we could get stuck
+      // in an endless loop of re-running the same instruction, calling this signal handler,
+      // and re-enabling MTE before we had a chance to re-run the instruction.
+      if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &timerid) == -1) {
+        fatal_errno("timer_create() failed");
+      }
+      struct itimerspec its {};
+      its.it_value.tv_sec = reenable_timer / 1000;
+      its.it_value.tv_nsec = (reenable_timer % 1000) * 1000000;
+
+      if (timer_settime(timerid, 0, &its, nullptr) == -1) {
+        fatal_errno("timer_settime() failed");
+      }
+    } else {
+      async_safe_format_log(
+          ANDROID_LOG_ERROR, "libc",
+          "MTE ERROR DETECTED BUT RUNNING IN PERMISSIVE MODE. CONTINUING WITH MTE DISABLED.");
+    }
+    pthread_mutex_unlock(&crash_mutex);
   }
 
   // If sival_int is ~0, it means that the fallback handler has been called
@@ -593,7 +713,7 @@ static void debuggerd_signal_handler(int signal_number, siginfo_t* info, void* c
     // you can only set NO_NEW_PRIVS to 1, and the effect should be at worst a single missing
     // ANR trace.
     debuggerd_fallback_handler(info, ucontext, process_info.abort_msg);
-    if (no_new_privs && process_info.recoverable_gwp_asan_crash) {
+    if (no_new_privs && recoverable_gwp_asan_crash) {
       gwp_asan_callbacks.debuggerd_gwp_asan_post_crash_report(info->si_addr);
       return;
     }
@@ -670,29 +790,14 @@ static void debuggerd_signal_handler(int signal_number, siginfo_t* info, void* c
     // If the signal is fatal, don't unlock the mutex to prevent other crashing threads from
     // starting to dump right before our death.
     pthread_mutex_unlock(&crash_mutex);
-  } else if (process_info.recoverable_gwp_asan_crash) {
-    gwp_asan_callbacks.debuggerd_gwp_asan_post_crash_report(info->si_addr);
+  } else if (process_info.recoverable_crash) {
+    if (recoverable_gwp_asan_crash) {
+      gwp_asan_callbacks.debuggerd_gwp_asan_post_crash_report(info->si_addr);
+    }
     pthread_mutex_unlock(&crash_mutex);
   }
 #ifdef __aarch64__
-  else if (info->si_signo == SIGSEGV &&
-           (info->si_code == SEGV_MTESERR || info->si_code == SEGV_MTEAERR) &&
-           is_permissive_mte()) {
-    // If we are in permissive MTE mode, we do not crash, but instead disable MTE on this thread,
-    // and then let the failing instruction be retried. The second time should work (except
-    // if there is another non-MTE fault).
-    int tagged_addr_ctrl = prctl(PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0);
-    if (tagged_addr_ctrl < 0) {
-      fatal_errno("failed to PR_GET_TAGGED_ADDR_CTRL");
-    }
-    tagged_addr_ctrl = (tagged_addr_ctrl & ~PR_MTE_TCF_MASK) | PR_MTE_TCF_NONE;
-    if (prctl(PR_SET_TAGGED_ADDR_CTRL, tagged_addr_ctrl, 0, 0, 0) < 0) {
-      fatal_errno("failed to PR_SET_TAGGED_ADDR_CTRL");
-    }
-    async_safe_format_log(ANDROID_LOG_ERROR, "libc",
-                          "MTE ERROR DETECTED BUT RUNNING IN PERMISSIVE MODE. CONTINUING.");
-    pthread_mutex_unlock(&crash_mutex);
-  } else if (info->si_signo == SIGSEGV && info->si_code == SEGV_MTEAERR && getppid() == 1) {
+  else if (info->si_signo == SIGSEGV && info->si_code == SEGV_MTEAERR && getppid() == 1) {
     // Back channel to init (see system/core/init/service.cpp) to signal that
     // this process crashed due to an ASYNC MTE fault and should be considered
     // for upgrade to SYNC mode. We are re-using the ART profiler signal, which
@@ -718,19 +823,19 @@ void debuggerd_init(debuggerd_callbacks_t* callbacks) {
   }
 
   size_t thread_stack_pages = 8;
-  void* thread_stack_allocation = mmap(nullptr, PAGE_SIZE * (thread_stack_pages + 2), PROT_NONE,
+  void* thread_stack_allocation = mmap(nullptr, getpagesize() * (thread_stack_pages + 2), PROT_NONE,
                                        MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
   if (thread_stack_allocation == MAP_FAILED) {
     fatal_errno("failed to allocate debuggerd thread stack");
   }
 
-  char* stack = static_cast<char*>(thread_stack_allocation) + PAGE_SIZE;
-  if (mprotect(stack, PAGE_SIZE * thread_stack_pages, PROT_READ | PROT_WRITE) != 0) {
+  char* stack = static_cast<char*>(thread_stack_allocation) + getpagesize();
+  if (mprotect(stack, getpagesize() * thread_stack_pages, PROT_READ | PROT_WRITE) != 0) {
     fatal_errno("failed to mprotect debuggerd thread stack");
   }
 
   // Stack grows negatively, set it to the last byte in the page...
-  stack = (stack + thread_stack_pages * PAGE_SIZE - 1);
+  stack = (stack + thread_stack_pages * getpagesize() - 1);
   // and align it.
   stack -= 15;
   pseudothread_stack = stack;
@@ -744,7 +849,6 @@ void debuggerd_init(debuggerd_callbacks_t* callbacks) {
   // Use the alternate signal stack if available so we can catch stack overflows.
   action.sa_flags |= SA_ONSTACK;
 
-#define SA_EXPOSE_TAGBITS 0x00000800
   // Request that the kernel set tag bits in the fault address. This is necessary for diagnosing MTE
   // faults.
   action.sa_flags |= SA_EXPOSE_TAGBITS;
@@ -752,18 +856,8 @@ void debuggerd_init(debuggerd_callbacks_t* callbacks) {
   debuggerd_register_handlers(&action);
 }
 
-// When debuggerd's signal handler is the first handler called, it's great at
-// handling the recoverable GWP-ASan mode. For apps, sigchain (from libart) is
-// always the first signal handler, and so the following function is what
-// sigchain must call before processing the signal. This allows for processing
-// of a potentially recoverable GWP-ASan crash. If the signal requires GWP-ASan
-// recovery, then dump a report (via the regular debuggerd hanndler), and patch
-// up the allocator, and allow the process to continue (indicated by returning
-// 'true'). If the crash has nothing to do with GWP-ASan, or recovery isn't
-// possible, return 'false'.
-bool debuggerd_handle_signal(int signal_number, siginfo_t* info, void* context) {
-  if (signal_number != SIGSEGV || !signal_has_si_addr(info)) return false;
-
+bool debuggerd_handle_gwp_asan_signal(int signal_number, siginfo_t* info, void* context) {
+  if (g_callbacks.get_gwp_asan_callbacks == nullptr) return false;
   gwp_asan_callbacks_t gwp_asan_callbacks = g_callbacks.get_gwp_asan_callbacks();
   if (gwp_asan_callbacks.debuggerd_needs_gwp_asan_recovery == nullptr ||
       gwp_asan_callbacks.debuggerd_gwp_asan_pre_crash_report == nullptr ||
@@ -799,4 +893,34 @@ bool debuggerd_handle_signal(int signal_number, siginfo_t* info, void* context) 
 
   pthread_mutex_unlock(&first_crash_mutex);
   return true;
+}
+
+// When debuggerd's signal handler is the first handler called, it's great at
+// handling the recoverable GWP-ASan and permissive MTE modes. For apps,
+// sigchain (from libart) is always the first signal handler, and so the
+// following function is what sigchain must call before processing the signal.
+// This allows for processing of a potentially recoverable GWP-ASan or MTE
+// crash. If the signal requires recovery, then dump a report (via the regular
+// debuggerd hanndler), and patch up the allocator (in the case of GWP-ASan) or
+// disable MTE on the thread, and allow the process to continue (indicated by
+// returning 'true'). If the crash has nothing to do with GWP-ASan/MTE, or
+// recovery isn't possible, return 'false'.
+bool debuggerd_handle_signal(int signal_number, siginfo_t* info, void* context) {
+  if (signal_number != SIGSEGV) return false;
+  if (info->si_code == SEGV_MTEAERR || info->si_code == SEGV_MTESERR) {
+    if (!is_permissive_mte()) return false;
+    // Because permissive MTE disables MTE for the entire thread, we're less
+    // worried about getting a whole bunch of crashes in a row. ActivityManager
+    // doesn't like multiple native crashes for an app in a short period of time
+    // (see the comment about recoverable GWP-ASan in
+    // `debuggerd_handle_gwp_asan_signal`), but that shouldn't happen if MTE is
+    // disabled for the entire thread. This might need to be changed if there's
+    // some low-hanging bug that happens across multiple threads in quick
+    // succession.
+    debuggerd_signal_handler(signal_number, info, context);
+    return true;
+  }
+
+  if (!signal_has_si_addr(info)) return false;
+  return debuggerd_handle_gwp_asan_signal(signal_number, info, context);
 }

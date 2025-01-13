@@ -63,9 +63,13 @@ constexpr const char gatekeeperServiceName[] = "android.hardware.gatekeeper.IGat
 
 GateKeeperProxy::GateKeeperProxy() {
     clear_state_if_needed_done = false;
-    hw_device = IGatekeeper::getService();
-    ::ndk::SpAIBinder ks2Binder(AServiceManager_getService(gatekeeperServiceName));
-    aidl_hw_device = AidlIGatekeeper::fromBinder(ks2Binder);
+    if (AServiceManager_isDeclared(gatekeeperServiceName)) {
+        ::ndk::SpAIBinder ks2Binder(AServiceManager_waitForService(gatekeeperServiceName));
+        aidl_hw_device = AidlIGatekeeper::fromBinder(ks2Binder);
+    }
+    if (!aidl_hw_device) {
+        hw_device = IGatekeeper::getService();
+    }
     is_running_gsi = android::base::GetBoolProperty(android::gsi::kGsiBootedProp, false);
 
     if (!aidl_hw_device && !hw_device) {
@@ -144,14 +148,22 @@ void GateKeeperProxy::clear_sid(uint32_t userId) {
     }
 }
 
-uint32_t GateKeeperProxy::adjust_userId(uint32_t userId) {
+Status GateKeeperProxy::adjust_userId(uint32_t userId, uint32_t* hw_userId) {
     static constexpr uint32_t kGsiOffset = 1000000;
-    CHECK(userId < kGsiOffset);
-    CHECK((aidl_hw_device != nullptr) || (hw_device != nullptr));
-    if (is_running_gsi) {
-        return userId + kGsiOffset;
+    if (userId >= kGsiOffset) {
+        return Status::fromExceptionCode(Status::EX_ILLEGAL_ARGUMENT);
     }
-    return userId;
+
+    if ((aidl_hw_device == nullptr) && (hw_device == nullptr)) {
+        return Status::fromExceptionCode(Status::EX_ILLEGAL_STATE);
+    }
+
+    if (is_running_gsi) {
+        *hw_userId = userId + kGsiOffset;
+        return Status::ok();
+    }
+    *hw_userId = userId;
+    return Status::ok();
 }
 
 #define GK_ERROR *gkResponse = GKResponse::error(), Status::ok()
@@ -201,7 +213,12 @@ Status GateKeeperProxy::enroll(int32_t userId,
     android::hardware::hidl_vec<uint8_t> newPwd;
     newPwd.setToExternal(const_cast<uint8_t*>(desiredPassword.data()), desiredPassword.size());
 
-    uint32_t hw_userId = adjust_userId(userId);
+    uint32_t hw_userId = 0;
+    Status result = adjust_userId(userId, &hw_userId);
+    if (!result.isOk()) {
+        return result;
+    }
+
     uint64_t secureUserId = 0;
     if (aidl_hw_device) {
         // AIDL gatekeeper service
@@ -300,7 +317,12 @@ Status GateKeeperProxy::verifyChallenge(int32_t userId, int64_t challenge,
         }
     }
 
-    uint32_t hw_userId = adjust_userId(userId);
+    uint32_t hw_userId = 0;
+    Status result = adjust_userId(userId, &hw_userId);
+    if (!result.isOk()) {
+        return result;
+    }
+
     android::hardware::hidl_vec<uint8_t> curPwdHandle;
     curPwdHandle.setToExternal(const_cast<uint8_t*>(enrolledPasswordHandle.data()),
                                enrolledPasswordHandle.size());
@@ -410,7 +432,12 @@ Status GateKeeperProxy::clearSecureUserId(int32_t userId) {
     }
     clear_sid(userId);
 
-    uint32_t hw_userId = adjust_userId(userId);
+    uint32_t hw_userId = 0;
+    Status result = adjust_userId(userId, &hw_userId);
+    if (!result.isOk()) {
+        return result;
+    }
+
     if (aidl_hw_device) {
         aidl_hw_device->deleteUser(hw_userId);
     } else if (hw_device) {
