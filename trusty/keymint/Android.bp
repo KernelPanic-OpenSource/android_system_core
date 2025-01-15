@@ -17,25 +17,44 @@ package {
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
-rust_binary {
-    name: "android.hardware.security.keymint-service.rust.trusty",
+rust_defaults {
+    name: "android.hardware.security.keymint-service.rust.trusty.default",
     relative_install_path: "hw",
-    vendor: true,
-    init_rc: ["android.hardware.security.keymint-service.rust.trusty.rc"],
-    vintf_fragments: ["android.hardware.security.keymint-service.rust.trusty.xml"],
     srcs: [
-        "src/keymint_hal_main.rs"
+        "src/keymint_hal_main.rs",
     ],
     rustlibs: [
         "libandroid_logger",
         "libbinder_rs",
+        "libclap",
         "libkmr_wire",
         "libkmr_hal",
         "libtrusty-rs",
         "liblibc",
         "liblog_rust",
     ],
-    required: [
-        "android.hardware.hardware_keystore.xml",
+    prefer_rlib: true,
+}
+
+rust_binary {
+    name: "android.hardware.security.keymint-service.rust.trusty",
+    vendor: true,
+    defaults: ["android.hardware.security.keymint-service.rust.trusty.default"],
+    init_rc: ["android.hardware.security.keymint-service.rust.trusty.rc"],
+    vintf_fragments: ["android.hardware.security.keymint-service.rust.trusty.xml"],
+    required: select(release_flag("RELEASE_AIDL_USE_UNFROZEN"), {
+        true: ["android.hardware.hardware_keystore.xml"],
+        default: ["android.hardware.hardware_keystore_V3.xml"],
+    }),
+}
+
+rust_binary {
+    name: "android.hardware.security.keymint-service.rust.trusty.system.nonsecure",
+    system_ext_specific: true,
+    defaults: ["android.hardware.security.keymint-service.rust.trusty.default"],
+    init_rc: ["android.hardware.security.keymint-service.rust.trusty.system.nonsecure.rc"],
+    features: ["nonsecure"],
+    rustlibs: [
+        "libkmr_hal_nonsecure",
     ],
 }

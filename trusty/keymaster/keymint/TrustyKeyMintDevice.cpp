@@ -258,7 +258,11 @@ ScopedAStatus TrustyKeyMintDevice::deleteAllKeys() {
 }
 
 ScopedAStatus TrustyKeyMintDevice::destroyAttestationIds() {
-    return kmError2ScopedAStatus(KM_ERROR_UNIMPLEMENTED);
+    keymaster::DestroyAttestationIdsRequest request(impl_->message_version());
+    keymaster::DestroyAttestationIdsResponse response(impl_->message_version());
+    impl_->DestroyAttestationIds(request, &response);
+
+    return kmError2ScopedAStatus(response.error);
 }
 
 ScopedAStatus TrustyKeyMintDevice::begin(KeyPurpose purpose, const vector<uint8_t>& keyBlob,
@@ -343,6 +347,20 @@ ScopedAStatus TrustyKeyMintDevice::getRootOfTrust(const array<uint8_t, 16>& chal
 
 ScopedAStatus TrustyKeyMintDevice::sendRootOfTrust(const vector<uint8_t>& /* rootOfTrust */) {
     return kmError2ScopedAStatus(KM_ERROR_UNIMPLEMENTED);
+}
+
+ScopedAStatus TrustyKeyMintDevice::setAdditionalAttestationInfo(const vector<KeyParameter>& info) {
+    keymaster::SetAdditionalAttestationInfoRequest request(impl_->message_version());
+    request.info.Reinitialize(KmParamSet(info));
+
+    keymaster::SetAdditionalAttestationInfoResponse response =
+            impl_->SetAdditionalAttestationInfo(request);
+
+    if (response.error != KM_ERROR_OK) {
+        return kmError2ScopedAStatus(response.error);
+    } else {
+        return ScopedAStatus::ok();
+    }
 }
 
 }  // namespace aidl::android::hardware::security::keymint::trusty

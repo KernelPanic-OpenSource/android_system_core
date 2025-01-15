@@ -27,7 +27,6 @@
 #include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/strings.h>
-#include <hidl-util/FQName.h>
 #include <processgroup/processgroup.h>
 #include <system/thread_defs.h>
 
@@ -51,6 +50,18 @@ using android::base::StartsWith;
 
 namespace android {
 namespace init {
+
+#ifdef INIT_FULL_SOURCES
+// on full sources, we have better information on device to
+// make this decision
+constexpr bool kAlwaysErrorUserRoot = false;
+#else
+constexpr uint64_t kBuildShippingApiLevel = BUILD_SHIPPING_API_LEVEL + 0 /* +0 if empty */;
+// on partial sources, the host build, we don't have the specific
+// vendor API level, but we can enforce things based on the
+// shipping API level.
+constexpr bool kAlwaysErrorUserRoot = kBuildShippingApiLevel > __ANDROID_API_V__;
+#endif
 
 Result<void> ServiceParser::ParseCapabilities(std::vector<std::string>&& args) {
     service_->capabilities_ = 0;
@@ -179,8 +190,9 @@ Result<void> ServiceParser::ParsePriority(std::vector<std::string>&& args) {
     if (!ParseInt(args[1], &service_->proc_attr_.priority,
                   static_cast<int>(ANDROID_PRIORITY_HIGHEST),  // highest is negative
                   static_cast<int>(ANDROID_PRIORITY_LOWEST))) {
-        return Errorf("process priority value must be range {} - {}", ANDROID_PRIORITY_HIGHEST,
-                      ANDROID_PRIORITY_LOWEST);
+        return Errorf("process priority value must be range {} - {}",
+                      static_cast<int>(ANDROID_PRIORITY_HIGHEST),
+                      static_cast<int>(ANDROID_PRIORITY_LOWEST));
     }
     return {};
 }
@@ -188,24 +200,6 @@ Result<void> ServiceParser::ParsePriority(std::vector<std::string>&& args) {
 Result<void> ServiceParser::ParseInterface(std::vector<std::string>&& args) {
     const std::string& interface_name = args[1];
     const std::string& instance_name = args[2];
-
-    // AIDL services don't use fully qualified names and instead just use "interface aidl <name>"
-    if (interface_name != "aidl") {
-        FQName fq_name;
-        if (!FQName::parse(interface_name, &fq_name)) {
-            return Error() << "Invalid fully-qualified name for interface '" << interface_name
-                           << "'";
-        }
-
-        if (!fq_name.isFullyQualified()) {
-            return Error() << "Interface name not fully-qualified '" << interface_name << "'";
-        }
-
-        if (fq_name.isValidValueName()) {
-            return Error() << "Interface name must not be a value name '" << interface_name << "'";
-        }
-    }
-
     const std::string fullname = interface_name + "/" + instance_name;
 
     for (const auto& svc : *service_list_) {
@@ -315,6 +309,11 @@ Result<void> ServiceParser::ParseOverride(std::vector<std::string>&& args) {
     return {};
 }
 
+Result<void> ServiceParser::ParseSharedKallsyms(std::vector<std::string>&& args) {
+    service_->shared_kallsyms_file_ = true;
+    return {};
+}
+
 Result<void> ServiceParser::ParseMemcgSwappiness(std::vector<std::string>&& args) {
     if (!ParseInt(args[1], &service_->swappiness_, 0)) {
         return Error() << "swappiness value must be equal or greater than 0";
@@ -370,8 +369,8 @@ Result<void> ServiceParser::ParseRebootOnFailure(std::vector<std::string>&& args
 
 Result<void> ServiceParser::ParseRestartPeriod(std::vector<std::string>&& args) {
     int period;
-    if (!ParseInt(args[1], &period, 5)) {
-        return Error() << "restart_period value must be an integer >= 5";
+    if (!ParseInt(args[1], &period, 0)) {
+        return Error() << "restart_period value must be an integer >= 0";
     }
     service_->restart_period_ = std::chrono::seconds(period);
     return {};
@@ -544,12 +543,9 @@ Result<void> ServiceParser::ParseUser(std::vector<std::string>&& args) {
 // when we migrate to cgroups v2 while these hardcoded paths stay the same.
 static std::optional<const std::string> ConvertTaskFileToProfile(const std::string& file) {
     static const std::map<const std::string, const std::string> map = {
-            {"/dev/stune/top-app/tasks", "MaxPerformance"},
-            {"/dev/stune/foreground/tasks", "HighPerformance"},
             {"/dev/cpuset/camera-daemon/tasks", "CameraServiceCapacity"},
             {"/dev/cpuset/foreground/tasks", "ProcessCapacityHigh"},
             {"/dev/cpuset/system-background/tasks", "ServiceCapacityLow"},
-            {"/dev/stune/nnapi-hal/tasks", "NNApiHALPerformance"},
             {"/dev/blkio/background/tasks", "LowIoPriority"},
     };
     auto iter = map.find(file);
@@ -612,6 +608,7 @@ const KeywordMap<ServiceParser::OptionParser>& ServiceParser::GetParserMap() con
         {"rlimit",                  {3,     3,    &ServiceParser::ParseProcessRlimit}},
         {"seclabel",                {1,     1,    &ServiceParser::ParseSeclabel}},
         {"setenv",                  {2,     2,    &ServiceParser::ParseSetenv}},
+        {"shared_kallsyms",         {0,     0,    &ServiceParser::ParseSharedKallsyms}},
         {"shutdown",                {1,     1,    &ServiceParser::ParseShutdown}},
         {"sigstop",                 {0,     0,    &ServiceParser::ParseSigstop}},
         {"socket",                  {3,     6,    &ServiceParser::ParseSocket}},
@@ -679,20 +676,13 @@ Result<void> ServiceParser::EndSection() {
     }
 
     if (service_->proc_attr_.parsed_uid == std::nullopt) {
-        if (android::base::GetIntProperty("ro.vendor.api_level", 0) > __ANDROID_API_U__) {
+        if (kAlwaysErrorUserRoot ||
+            android::base::GetIntProperty("ro.vendor.api_level", 0) > 202404) {
             return Error() << "No user specified for service '" << service_->name()
-                           << "'. Defaults to root.";
+                           << "', so it would have been root.";
         } else {
             LOG(WARNING) << "No user specified for service '" << service_->name()
-                         << "'. Defaults to root.";
-        }
-    }
-
-    if (interface_inheritance_hierarchy_) {
-        if (const auto& check_hierarchy_result = CheckInterfaceInheritanceHierarchy(
-                    service_->interfaces(), *interface_inheritance_hierarchy_);
-            !check_hierarchy_result.ok()) {
-            return Error() << check_hierarchy_result.error();
+                         << "', so it is root.";
         }
     }
 

@@ -34,9 +34,11 @@
 #include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <cutils/android_get_control_file.h>
 #include <cutils/sockets.h>
 #include <processgroup/processgroup.h>
 #include <selinux/selinux.h>
+#include <sys/signalfd.h>
 
 #include <string>
 
@@ -50,7 +52,6 @@
 #endif
 
 #ifdef INIT_FULL_SOURCES
-#include <ApexProperties.sysprop.h>
 #include <android/api-level.h>
 
 #include "mount_namespace.h"
@@ -69,6 +70,7 @@ using android::base::make_scope_guard;
 using android::base::SetProperty;
 using android::base::StartsWith;
 using android::base::StringPrintf;
+using android::base::unique_fd;
 using android::base::WriteStringToFile;
 
 namespace android {
@@ -195,28 +197,20 @@ void Service::NotifyStateChange(const std::string& new_state) const {
     }
 }
 
-void Service::KillProcessGroup(int signal, bool report_oneshot) {
-    // If we've already seen a successful result from killProcessGroup*(), then we have removed
-    // the cgroup already and calling these functions a second time will simply result in an error.
-    // This is true regardless of which signal was sent.
-    // These functions handle their own logging, so no additional logging is needed.
-    if (!process_cgroup_empty_) {
+void Service::KillProcessGroup(int signal) {
+    // Always attempt the process kill if process is still running.
+    // Cgroup clean up routines are idempotent. It's safe to call
+    // killProcessGroup repeatedly. During shutdown, `init` will
+    // call this function to send SIGTERM/SIGKILL to all processes.
+    // These signals must be sent for a successful shutdown.
+    if (!process_cgroup_empty_ || IsRunning()) {
         LOG(INFO) << "Sending signal " << signal << " to service '" << name_ << "' (pid " << pid_
                   << ") process group...";
-        int max_processes = 0;
         int r;
         if (signal == SIGTERM) {
-            r = killProcessGroupOnce(uid(), pid_, signal, &max_processes);
+            r = killProcessGroupOnce(uid(), pid_, signal);
         } else {
-            r = killProcessGroup(uid(), pid_, signal, &max_processes);
-        }
-
-        if (report_oneshot && max_processes > 0) {
-            LOG(WARNING)
-                    << "Killed " << max_processes
-                    << " additional processes from a oneshot process group for service '" << name_
-                    << "'. This is new behavior, previously child processes would not be killed in "
-                       "this case.";
+            r = killProcessGroup(uid(), pid_, signal);
         }
 
         if (r == 0) process_cgroup_empty_ = true;
@@ -266,7 +260,7 @@ void Service::SetProcessAttributesAndCaps(InterprocessFifo setsid_finished) {
 
 void Service::Reap(const siginfo_t& siginfo) {
     if (!(flags_ & SVC_ONESHOT) || (flags_ & SVC_RESTART)) {
-        KillProcessGroup(SIGKILL, false);
+        KillProcessGroup(SIGKILL);
     } else {
         // Legacy behavior from ~2007 until Android R: this else branch did not exist and we did not
         // kill the process group in this case.
@@ -274,7 +268,7 @@ void Service::Reap(const siginfo_t& siginfo) {
             // The new behavior in Android R is to kill these process groups in all cases.  The
             // 'true' parameter instructions KillProcessGroup() to report a warning message where it
             // detects a difference in behavior has occurred.
-            KillProcessGroup(SIGKILL, true);
+            KillProcessGroup(SIGKILL);
         }
     }
 
@@ -308,6 +302,7 @@ void Service::Reap(const siginfo_t& siginfo) {
     pid_ = 0;
     flags_ &= (~SVC_RUNNING);
     start_order_ = 0;
+    was_last_exit_ok_ = siginfo.si_code == CLD_EXITED && siginfo.si_status == 0;
 
     // Oneshot processes go into the disabled state on exit,
     // except when manually restarted.
@@ -322,7 +317,7 @@ void Service::Reap(const siginfo_t& siginfo) {
     }
 
 #if INIT_FULL_SOURCES
-    static bool is_apex_updatable = android::sysprop::ApexProperties::updatable().value_or(false);
+    static bool is_apex_updatable = true;
 #else
     static bool is_apex_updatable = false;
 #endif
@@ -361,19 +356,35 @@ void Service::Reap(const siginfo_t& siginfo) {
     // If we crash > 4 times in 'fatal_crash_window_' minutes or before boot_completed,
     // reboot into bootloader or set crashing property
     boot_clock::time_point now = boot_clock::now();
-    if (((flags_ & SVC_CRITICAL) || is_process_updatable) && !(flags_ & SVC_RESTART)) {
+    constexpr const char native_watchdog_reboot_time[] = "persist.init.svc.last_fatal_reboot_epoch";
+    uint64_t throttle_window =
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::hours(24)).count();
+    if (((flags_ & SVC_CRITICAL) || is_process_updatable) && !(flags_ & SVC_RESTART) &&
+        !was_last_exit_ok_) {
         bool boot_completed = GetBoolProperty("sys.boot_completed", false);
         if (now < time_crashed_ + fatal_crash_window_ || !boot_completed) {
             if (++crash_count_ > 4) {
-                auto exit_reason = boot_completed ?
-                    "in " + std::to_string(fatal_crash_window_.count()) + " minutes" :
-                    "before boot completed";
+                auto exit_reason =
+                        boot_completed
+                                ? "in " + std::to_string(fatal_crash_window_.count()) + " minutes"
+                                : "before boot completed";
                 if (flags_ & SVC_CRITICAL) {
                     if (!GetBoolProperty("init.svc_debug.no_fatal." + name_, false)) {
-                        // Aborts into `fatal_reboot_target_'.
-                        SetFatalRebootTarget(fatal_reboot_target_);
-                        LOG(FATAL) << "critical process '" << name_ << "' exited 4 times "
-                                   << exit_reason;
+                        uint64_t epoch_time =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+                        // Do not reboot again If it was already initiated in the last 24hrs
+                        if (epoch_time - GetIntProperty(native_watchdog_reboot_time, 0) >
+                            throttle_window) {
+                            SetProperty(native_watchdog_reboot_time, std::to_string(epoch_time));
+                            // Aborts into `fatal_reboot_target_'.
+                            SetFatalRebootTarget(fatal_reboot_target_);
+                            LOG(FATAL) << "critical process '" << name_ << "' exited 4 times "
+                                       << exit_reason;
+                        } else {
+                            LOG(INFO) << "Reboot already performed in last 24hrs because of crash.";
+                        }
                     }
                 } else {
                     LOG(ERROR) << "process with updatable components '" << name_
@@ -419,7 +430,7 @@ Result<void> Service::ExecStart() {
         }
     });
 
-    if (is_updatable() && !ServiceList::GetInstance().IsServicesUpdated()) {
+    if (is_updatable() && !IsDefaultMountNamespaceReady()) {
         // Don't delay the service for ExecStart() as the semantic is that
         // the caller might depend on the side effect of the execution.
         return Error() << "Cannot start an updatable service '" << name_
@@ -580,7 +591,7 @@ Result<void> Service::Start() {
         }
     });
 
-    if (is_updatable() && !ServiceList::GetInstance().IsServicesUpdated()) {
+    if (is_updatable() && !IsDefaultMountNamespaceReady()) {
         ServiceList::GetInstance().DelayService(*this);
         return Error() << "Cannot start an updatable service '" << name_
                        << "' before configs from APEXes are all loaded. "
@@ -643,8 +654,6 @@ Result<void> Service::Start() {
         SetMountNamespace();
     }
 
-    post_data_ = ServiceList::GetInstance().IsPostData();
-
     LOG(INFO) << "starting service '" << name_ << "'...";
 
     std::vector<Descriptor> descriptors;
@@ -661,6 +670,14 @@ Result<void> Service::Start() {
             descriptors.emplace_back(std::move(*result));
         } else {
             LOG(INFO) << "Could not open file '" << file.name << "': " << result.error();
+        }
+    }
+
+    if (shared_kallsyms_file_) {
+        if (auto result = CreateSharedKallsymsFd(); result.ok()) {
+            descriptors.emplace_back(std::move(*result));
+        } else {
+            LOG(INFO) << "Could not obtain a copy of /proc/kallsyms: " << result.error();
         }
     }
 
@@ -796,6 +813,64 @@ void Service::SetMountNamespace() {
     }
     // Use the "default" mount namespace only if it's ready
     mount_namespace_ = IsDefaultMountNamespaceReady() ? NS_DEFAULT : NS_BOOTSTRAP;
+}
+
+static int ThreadCount() {
+    std::unique_ptr<DIR, decltype(&closedir)> dir(opendir("/proc/self/task"), closedir);
+    if (!dir) {
+        return -1;
+    }
+
+    int count = 0;
+    dirent* entry;
+    while ((entry = readdir(dir.get())) != nullptr) {
+        if (entry->d_name[0] != '.') {
+            count++;
+        }
+    }
+    return count;
+}
+
+// Must be called BEFORE any threads are created. See also the sigprocmask() man page.
+unique_fd Service::CreateSigchldFd() {
+    CHECK_EQ(ThreadCount(), 1);
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &mask, nullptr) < 0) {
+        PLOG(FATAL) << "Failed to block SIGCHLD";
+    }
+
+    return unique_fd(signalfd(-1, &mask, SFD_CLOEXEC));
+}
+
+void Service::OpenAndSaveStaticKallsymsFd() {
+    Result<Descriptor> result = CreateSharedKallsymsFd();
+    if (!result.ok()) {
+      LOG(ERROR) << result.error();
+    }
+}
+
+// This function is designed to be called in two situations:
+// 1) early during second_stage init, to open and save the shared fd as a
+//    static (see OpenAndSaveStaticKallsymsFd).
+// 2) whenever a service requesting a copy of the fd is being started, at which
+//    point it will get a duplicated copy of the static fd.
+Result<Descriptor> Service::CreateSharedKallsymsFd() {
+    static constexpr char kallsyms_path[] = "/proc/kallsyms";
+    static int static_fd = open(kallsyms_path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (static_fd < 0) {
+        return ErrnoError() << "failed to open " << kallsyms_path;
+    }
+
+    unique_fd fd{fcntl(static_fd, F_DUPFD_CLOEXEC, /*min_fd=*/3)};
+    if (fd < 0) {
+        return ErrnoError() << "failed fcntl(F_DUPFD_CLOEXEC)";
+    }
+
+    // Use the same environment variable as if the service specified
+    // "file /proc/kallsyms r".
+    return Descriptor(std::string(ANDROID_FILE_ENV_PREFIX) + kallsyms_path, std::move(fd));
 }
 
 void Service::SetStartedInFirstStage(pid_t pid) {

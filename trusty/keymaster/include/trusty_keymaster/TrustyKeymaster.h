@@ -55,6 +55,8 @@ class TrustyKeymaster {
     void UpgradeKey(const UpgradeKeyRequest& request, UpgradeKeyResponse* response);
     void DeleteKey(const DeleteKeyRequest& request, DeleteKeyResponse* response);
     void DeleteAllKeys(const DeleteAllKeysRequest& request, DeleteAllKeysResponse* response);
+    void DestroyAttestationIds(const DestroyAttestationIdsRequest& request,
+                               DestroyAttestationIdsResponse* response);
     void BeginOperation(const BeginOperationRequest& request, BeginOperationResponse* response);
     void UpdateOperation(const UpdateOperationRequest& request, UpdateOperationResponse* response);
     void FinishOperation(const FinishOperationRequest& request, FinishOperationResponse* response);
@@ -68,6 +70,8 @@ class TrustyKeymaster {
     ConfigureVendorPatchlevelResponse ConfigureVendorPatchlevel(
             const ConfigureVendorPatchlevelRequest& request);
     GetRootOfTrustResponse GetRootOfTrust(const GetRootOfTrustRequest& request);
+    SetAdditionalAttestationInfoResponse SetAdditionalAttestationInfo(
+            const SetAdditionalAttestationInfoRequest& request);
     GetHwInfoResponse GetHwInfo();
 
     uint32_t message_version() const { return message_version_; }

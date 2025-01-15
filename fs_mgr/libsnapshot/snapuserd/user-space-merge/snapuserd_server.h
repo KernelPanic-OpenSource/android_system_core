@@ -31,6 +31,7 @@
 #include <vector>
 
 #include <android-base/unique_fd.h>
+#include <snapuserd/block_server.h>
 #include "handler_manager.h"
 #include "snapuserd_core.h"
 
@@ -38,7 +39,9 @@ namespace android {
 namespace snapshot {
 
 static constexpr uint32_t kMaxPacketSize = 512;
-static constexpr uint8_t kMaxMergeThreads = 2;
+
+static constexpr char kBootSnapshotsWithoutSlotSwitch[] =
+        "/metadata/ota/snapshot-boot-without-slot-switch";
 
 class UserSnapshotServer {
   private:
@@ -50,6 +53,7 @@ class UserSnapshotServer {
     bool is_server_running_ = false;
     bool io_uring_enabled_ = false;
     std::unique_ptr<ISnapshotHandlerManager> handlers_;
+    std::unique_ptr<IBlockServerFactory> block_server_factory_;
 
     std::mutex lock_;
 
@@ -82,7 +86,10 @@ class UserSnapshotServer {
     std::shared_ptr<HandlerThread> AddHandler(const std::string& misc_name,
                                               const std::string& cow_device_path,
                                               const std::string& backing_device,
-                                              const std::string& base_path_merge);
+                                              const std::string& base_path_merge,
+                                              std::optional<uint32_t> num_worker_threads,
+                                              bool o_direct = false,
+                                              uint32_t cow_op_merge_size = 0);
     bool StartHandler(const std::string& misc_name);
 
     void SetTerminating() { terminating_ = true; }

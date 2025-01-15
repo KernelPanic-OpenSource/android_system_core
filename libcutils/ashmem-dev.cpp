@@ -44,16 +44,6 @@
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 
-/* Will be added to UAPI once upstream change is merged */
-#define F_SEAL_FUTURE_WRITE 0x0010
-
-/*
- * The minimum vendor API level at and after which it is safe to use memfd.
- * This is to facilitate deprecation of ashmem.
- */
-#define MIN_MEMFD_VENDOR_API_LEVEL 29
-#define MIN_MEMFD_VENDOR_API_LEVEL_CHAR 'Q'
-
 /* ashmem identity */
 static dev_t __ashmem_rdev;
 /*
@@ -91,54 +81,16 @@ static bool pin_deprecation_warn = true; /* Log the pin deprecation warning only
 
 /* Determine if vendor processes would be ok with memfd in the system:
  *
- * If VNDK is using older libcutils, don't use memfd. This is so that the
- * same shared memory mechanism is used across binder transactions between
- * vendor partition processes and system partition processes.
+ * Previously this function checked if memfd is supported by checking if
+ * vendor VNDK version is greater than Q. As we can assume all treblelized
+ * device using this code is up to date enough to use memfd, memfd is allowed
+ * if the device is treblelized.
  */
 static bool check_vendor_memfd_allowed() {
-    std::string vndk_version = android::base::GetProperty("ro.vndk.version", "");
+    static bool is_treblelized = android::base::GetBoolProperty("ro.treble.enabled", false);
 
-    if (vndk_version == "") {
-        ALOGE("memfd: ro.vndk.version not defined or invalid (%s), this is mandated since P.\n",
-              vndk_version.c_str());
-        return false;
-    }
-
-    /* No issues if vendor is targetting current Dessert */
-    if (vndk_version == "current") {
-        return false;
-    }
-
-    /* Check if VNDK version is a number and act on it */
-    char* p;
-    long int vers = strtol(vndk_version.c_str(), &p, 10);
-    if (*p == 0) {
-        if (vers < MIN_MEMFD_VENDOR_API_LEVEL) {
-            ALOGI("memfd: device VNDK version (%s) is < Q so using ashmem.\n",
-                  vndk_version.c_str());
-            return false;
-        }
-
-        return true;
-    }
-
-    // Non-numeric should be a single ASCII character. Characters after the
-    // first are ignored.
-    if (tolower(vndk_version[0]) < 'a' || tolower(vndk_version[0]) > 'z') {
-        ALOGE("memfd: ro.vndk.version not defined or invalid (%s), this is mandated since P.\n",
-              vndk_version.c_str());
-        return false;
-    }
-
-    if (tolower(vndk_version[0]) < tolower(MIN_MEMFD_VENDOR_API_LEVEL_CHAR)) {
-        ALOGI("memfd: device is using VNDK version (%s) which is less than Q. Use ashmem only.\n",
-              vndk_version.c_str());
-        return false;
-    }
-
-    return true;
+    return is_treblelized;
 }
-
 
 /* Determine if memfd can be supported. This is just one-time hardwork
  * which will be cached by the caller.
@@ -154,7 +106,7 @@ static bool __has_memfd_support() {
      */
     if (!android::base::GetBoolProperty("sys.use_memfd", false)) {
         if (debug_log) {
-            ALOGD("sys.use_memfd=false so memfd disabled\n");
+            ALOGD("sys.use_memfd=false so memfd disabled");
         }
         return false;
     }
@@ -162,20 +114,36 @@ static bool __has_memfd_support() {
     // Check if kernel support exists, otherwise fall back to ashmem.
     // This code needs to build on old API levels, so we can't use the libc
     // wrapper.
+    //
+    // MFD_NOEXEC_SEAL is used to match the semantics of the ashmem device,
+    // which did not have executable permissions. This also seals the executable
+    // permissions of the buffer (i.e. they cannot be changed by fchmod()).
+    //
+    // MFD_NOEXEC_SEAL implies MFD_ALLOW_SEALING.
     android::base::unique_fd fd(
-            syscall(__NR_memfd_create, "test_android_memfd", MFD_CLOEXEC | MFD_ALLOW_SEALING));
+            syscall(__NR_memfd_create, "test_android_memfd", MFD_CLOEXEC | MFD_NOEXEC_SEAL));
     if (fd == -1) {
-        ALOGE("memfd_create failed: %s, no memfd support.\n", strerror(errno));
+        ALOGE("memfd_create failed: %m, no memfd support");
         return false;
     }
 
     if (fcntl(fd, F_ADD_SEALS, F_SEAL_FUTURE_WRITE) == -1) {
-        ALOGE("fcntl(F_ADD_SEALS) failed: %s, no memfd support.\n", strerror(errno));
+        ALOGE("fcntl(F_ADD_SEALS) failed: %m, no memfd support");
+        return false;
+    }
+
+    /*
+     * Ensure that the kernel supports ashmem ioctl commands on memfds. If not,
+     * fall back to using ashmem.
+     */
+    if (TEMP_FAILURE_RETRY(ioctl(fd, ASHMEM_SET_SIZE, getpagesize())) < 0) {
+        ALOGE("ioctl(ASHMEM_SET_SIZE, %d) failed: %m, no ashmem-memfd compat support",
+              getpagesize());
         return false;
     }
 
     if (debug_log) {
-        ALOGD("memfd: device has memfd support, using it\n");
+        ALOGD("memfd: device has memfd support, using it");
     }
     return true;
 }
@@ -193,7 +161,7 @@ static std::string get_ashmem_device_path() {
     static const std::string boot_id_path = "/proc/sys/kernel/random/boot_id";
     std::string boot_id;
     if (!android::base::ReadFileToString(boot_id_path, &boot_id)) {
-        ALOGE("Failed to read %s: %s.\n", boot_id_path.c_str(), strerror(errno));
+        ALOGE("Failed to read %s: %m", boot_id_path.c_str());
         return "";
     };
     boot_id = android::base::Trim(boot_id);
@@ -315,7 +283,7 @@ static bool memfd_is_ashmem(int fd) {
 
     if (__ashmem_is_ashmem(fd, 0) == 0) {
         if (!fd_check_error_once) {
-            ALOGE("memfd: memfd expected but ashmem fd used - please use libcutils.\n");
+            ALOGE("memfd: memfd expected but ashmem fd used - please use libcutils");
             fd_check_error_once = true;
         }
 
@@ -337,20 +305,32 @@ int ashmem_valid(int fd)
 static int memfd_create_region(const char* name, size_t size) {
     // This code needs to build on old API levels, so we can't use the libc
     // wrapper.
-    android::base::unique_fd fd(syscall(__NR_memfd_create, name, MFD_CLOEXEC | MFD_ALLOW_SEALING));
+    //
+    // MFD_NOEXEC_SEAL to match the semantics of the ashmem device, which did
+    // not have executable permissions. This also seals the executable
+    // permissions of the buffer (i.e. they cannot be changed by fchmod()).
+    //
+    // MFD_NOEXEC_SEAL implies MFD_ALLOW_SEALING.
+    android::base::unique_fd fd(syscall(__NR_memfd_create, name, MFD_CLOEXEC | MFD_NOEXEC_SEAL));
 
     if (fd == -1) {
-        ALOGE("memfd_create(%s, %zd) failed: %s\n", name, size, strerror(errno));
+        ALOGE("memfd_create(%s, %zd) failed: %m", name, size);
         return -1;
     }
 
     if (ftruncate(fd, size) == -1) {
-        ALOGE("ftruncate(%s, %zd) failed for memfd creation: %s\n", name, size, strerror(errno));
+        ALOGE("ftruncate(%s, %zd) failed for memfd creation: %m", name, size);
+        return -1;
+    }
+
+    // forbid size changes to match ashmem behaviour
+    if (fcntl(fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK) == -1) {
+        ALOGE("memfd_create(%s, %zd) F_ADD_SEALS failed: %m", name, size);
         return -1;
     }
 
     if (debug_log) {
-        ALOGE("memfd_create(%s, %zd) success. fd=%d\n", name, size, fd.get());
+        ALOGE("memfd_create(%s, %zd) success. fd=%d", name, size, fd.get());
     }
     return fd.release();
 }
@@ -400,14 +380,28 @@ error:
 }
 
 static int memfd_set_prot_region(int fd, int prot) {
-    /* Only proceed if an fd needs to be write-protected */
+    int seals = fcntl(fd, F_GET_SEALS);
+    if (seals == -1) {
+        ALOGE("memfd_set_prot_region(%d, %d): F_GET_SEALS failed: %m", fd, prot);
+        return -1;
+    }
+
     if (prot & PROT_WRITE) {
+        /* Now we want the buffer to be read-write, let's check if the buffer
+         * has been previously marked as read-only before, if so return error
+         */
+        if (seals & F_SEAL_FUTURE_WRITE) {
+            ALOGE("memfd_set_prot_region(%d, %d): region is write protected", fd, prot);
+            errno = EINVAL;  // inline with ashmem error code, if already in
+                             // read-only mode
+            return -1;
+        }
         return 0;
     }
 
+    /* We would only allow read-only for any future file operations */
     if (fcntl(fd, F_ADD_SEALS, F_SEAL_FUTURE_WRITE) == -1) {
-        ALOGE("memfd_set_prot_region(%d, %d): F_SEAL_FUTURE_WRITE seal failed: %s\n", fd, prot,
-              strerror(errno));
+        ALOGE("memfd_set_prot_region(%d, %d): F_SEAL_FUTURE_WRITE seal failed: %m", fd, prot);
         return -1;
     }
 
@@ -426,7 +420,7 @@ int ashmem_set_prot_region(int fd, int prot)
 int ashmem_pin_region(int fd, size_t offset, size_t len)
 {
     if (!pin_deprecation_warn || debug_log) {
-        ALOGE("Pinning is deprecated since Android Q. Please use trim or other methods.\n");
+        ALOGE("Pinning is deprecated since Android Q. Please use trim or other methods.");
         pin_deprecation_warn = true;
     }
 
@@ -442,7 +436,7 @@ int ashmem_pin_region(int fd, size_t offset, size_t len)
 int ashmem_unpin_region(int fd, size_t offset, size_t len)
 {
     if (!pin_deprecation_warn || debug_log) {
-        ALOGE("Pinning is deprecated since Android Q. Please use trim or other methods.\n");
+        ALOGE("Pinning is deprecated since Android Q. Please use trim or other methods.");
         pin_deprecation_warn = true;
     }
 
@@ -461,12 +455,12 @@ int ashmem_get_size_region(int fd)
         struct stat sb;
 
         if (fstat(fd, &sb) == -1) {
-            ALOGE("ashmem_get_size_region(%d): fstat failed: %s\n", fd, strerror(errno));
+            ALOGE("ashmem_get_size_region(%d): fstat failed: %m", fd);
             return -1;
         }
 
         if (debug_log) {
-            ALOGD("ashmem_get_size_region(%d): %d\n", fd, static_cast<int>(sb.st_size));
+            ALOGD("ashmem_get_size_region(%d): %d", fd, static_cast<int>(sb.st_size));
         }
 
         return sb.st_size;

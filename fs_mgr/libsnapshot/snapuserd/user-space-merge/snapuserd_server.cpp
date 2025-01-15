@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/system_properties.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -31,11 +32,10 @@
 #include <android-base/scopeguard.h>
 #include <android-base/strings.h>
 #include <fs_mgr/file_wait.h>
+#include <snapuserd/dm_user_block_server.h>
 #include <snapuserd/snapuserd_client.h>
 #include "snapuserd_server.h"
-
-#define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
-#include <sys/_system_properties.h>
+#include "user-space-merge/snapuserd_core.h"
 
 namespace android {
 namespace snapshot {
@@ -48,6 +48,7 @@ using android::base::unique_fd;
 UserSnapshotServer::UserSnapshotServer() {
     terminating_ = false;
     handlers_ = std::make_unique<SnapshotHandlerManager>();
+    block_server_factory_ = std::make_unique<DmUserBlockServerFactory>();
 }
 
 UserSnapshotServer::~UserSnapshotServer() {
@@ -125,12 +126,17 @@ bool UserSnapshotServer::Receivemsg(android::base::borrowed_fd fd, const std::st
             return Sendmsg(fd, "fail");
         }
 
-        auto handler = AddHandler(out[1], out[2], out[3], out[4]);
+        auto handler = AddHandler(out[1], out[2], out[3], out[4], std::nullopt);
         if (!handler) {
             return Sendmsg(fd, "fail");
         }
 
-        auto retval = "success," + std::to_string(handler->snapuserd()->GetNumSectors());
+        auto num_sectors = handler->snapuserd()->GetNumSectors();
+        if (!num_sectors) {
+            return Sendmsg(fd, "fail");
+        }
+
+        auto retval = "success," + std::to_string(num_sectors);
         return Sendmsg(fd, retval);
     } else if (cmd == "start") {
         // Message format:
@@ -336,10 +342,11 @@ void UserSnapshotServer::Interrupt() {
     SetTerminating();
 }
 
-std::shared_ptr<HandlerThread> UserSnapshotServer::AddHandler(const std::string& misc_name,
-                                                              const std::string& cow_device_path,
-                                                              const std::string& backing_device,
-                                                              const std::string& base_path_merge) {
+std::shared_ptr<HandlerThread> UserSnapshotServer::AddHandler(
+        const std::string& misc_name, const std::string& cow_device_path,
+        const std::string& backing_device, const std::string& base_path_merge,
+        std::optional<uint32_t> num_worker_threads, const bool o_direct,
+        uint32_t cow_op_merge_size) {
     // We will need multiple worker threads only during
     // device boot after OTA. For all other purposes,
     // one thread is sufficient. We don't want to consume
@@ -348,18 +355,23 @@ std::shared_ptr<HandlerThread> UserSnapshotServer::AddHandler(const std::string&
     //
     // During boot up, we need multiple threads primarily for
     // update-verification.
-    int num_worker_threads = kNumWorkerThreads;
+    if (!num_worker_threads.has_value()) {
+        num_worker_threads = kNumWorkerThreads;
+    }
     if (is_socket_present_) {
         num_worker_threads = 1;
     }
 
-    bool perform_verification = true;
-    if (android::base::EndsWith(misc_name, "-init") || is_socket_present_) {
-        perform_verification = false;
+    if (android::base::EndsWith(misc_name, "-init") || is_socket_present_ ||
+        (access(kBootSnapshotsWithoutSlotSwitch, F_OK) == 0)) {
+        handlers_->DisableVerification();
     }
 
+    auto opener = block_server_factory_->CreateOpener(misc_name);
+
     return handlers_->AddHandler(misc_name, cow_device_path, backing_device, base_path_merge,
-                                 num_worker_threads, io_uring_enabled_, perform_verification);
+                                 opener, num_worker_threads.value(), io_uring_enabled_, o_direct,
+                                 cow_op_merge_size);
 }
 
 bool UserSnapshotServer::WaitForSocket() {

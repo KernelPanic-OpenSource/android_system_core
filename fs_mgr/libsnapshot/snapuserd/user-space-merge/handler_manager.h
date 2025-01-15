@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <android-base/unique_fd.h>
+#include <snapuserd/block_server.h>
 
 namespace android {
 namespace snapshot {
@@ -51,12 +52,11 @@ class ISnapshotHandlerManager {
     virtual ~ISnapshotHandlerManager() {}
 
     // Add a new snapshot handler but do not start serving requests yet.
-    virtual std::shared_ptr<HandlerThread> AddHandler(const std::string& misc_name,
-                                                      const std::string& cow_device_path,
-                                                      const std::string& backing_device,
-                                                      const std::string& base_path_merge,
-                                                      int num_worker_threads, bool use_iouring,
-                                                      bool perform_verification) = 0;
+    virtual std::shared_ptr<HandlerThread> AddHandler(
+            const std::string& misc_name, const std::string& cow_device_path,
+            const std::string& backing_device, const std::string& base_path_merge,
+            std::shared_ptr<IBlockServerOpener> opener, int num_worker_threads, bool use_iouring,
+            bool o_direct, uint32_t cow_op_merge_size) = 0;
 
     // Start serving requests on a snapshot handler.
     virtual bool StartHandler(const std::string& misc_name) = 0;
@@ -82,6 +82,9 @@ class ISnapshotHandlerManager {
 
     // Returns whether all snapshots have verified.
     virtual bool GetVerificationStatus() = 0;
+
+    // Disable partition verification
+    virtual void DisableVerification() = 0;
 };
 
 class SnapshotHandlerManager final : public ISnapshotHandlerManager {
@@ -91,8 +94,9 @@ class SnapshotHandlerManager final : public ISnapshotHandlerManager {
                                               const std::string& cow_device_path,
                                               const std::string& backing_device,
                                               const std::string& base_path_merge,
+                                              std::shared_ptr<IBlockServerOpener> opener,
                                               int num_worker_threads, bool use_iouring,
-                                              bool perform_verification) override;
+                                              bool o_direct, uint32_t cow_op_merge_size) override;
     bool StartHandler(const std::string& misc_name) override;
     bool DeleteHandler(const std::string& misc_name) override;
     bool InitiateMerge(const std::string& misc_name) override;
@@ -101,6 +105,7 @@ class SnapshotHandlerManager final : public ISnapshotHandlerManager {
     void TerminateMergeThreads() override;
     double GetMergePercentage() override;
     bool GetVerificationStatus() override;
+    void DisableVerification() override { perform_verification_ = false; }
 
   private:
     bool StartHandler(const std::shared_ptr<HandlerThread>& handler);
@@ -119,12 +124,13 @@ class SnapshotHandlerManager final : public ISnapshotHandlerManager {
     std::mutex lock_;
     HandlerList dm_users_;
 
-    bool is_merge_monitor_started_ = false;
     bool stop_monitor_merge_thread_ = false;
     int active_merge_threads_ = 0;
+    std::thread merge_monitor_;
     int num_partitions_merge_complete_ = 0;
     std::queue<std::shared_ptr<HandlerThread>> merge_handlers_;
     android::base::unique_fd monitor_merge_event_fd_;
+    bool perform_verification_ = true;
 };
 
 }  // namespace snapshot
